@@ -7,27 +7,27 @@ from aiogram.filters import CommandStart, CommandObject
 from aiogram.types import Message, FSInputFile
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+import aiohttp
 
 # ================= CONFIGURATION =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATA_FOLDER = "/app/data"  # مسار التخزين الدائم (Volume)
-MAX_FILE_SIZE_MB = 50      # حد أقصى للملف
-THRESHOLD_FOR_TEXT_OUTPUT = 20 # عدد النتائج التي تُرسل كنص قبل تحويلها لملف
-
 if not BOT_TOKEN:
     raise ValueError("Error: BOT_TOKEN environment variable is missing.")
 
-os.makedirs(DATA_FOLDER, exist_ok=True)
+LOCAL_DATA_DIR = "/app/data" 
+os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
 
-# Initialize Bot and Dispatcher
+# 2GB Limit for Local API
+MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024  
+THRESHOLD_FOR_TEXT_OUTPUT = 20 
+
 router = Router()
 dp = Dispatcher()
 dp.include_router(router)
 
-# ================= CORE LOGIC (Same as before, optimized for sync/async mix) =================
+# ================= CORE LOGIC =================
 
 def parse_line(line: str):
-    """Extracts url, login, pass from 'url:login:pass' format."""
     line = line.strip()
     if not line: return "", "", ""
     
@@ -35,7 +35,6 @@ def parse_line(line: str):
     if c1 == -1: return line, "", ""
     
     url_end = c1
-    # Handle protocols like https://
     if len(line) > c1 + 2 and line[c1:c1+3] == "://":
         c2 = line.find(":", c1 + 3)
         if c2 != -1: url_end = c2
@@ -48,7 +47,6 @@ def parse_line(line: str):
     return url_s, rest[:sep], rest[sep+1:]
 
 def search_file_sync(filepath: str, keyword: str) -> list:
-    """Searches a single file using mmap. Runs in thread pool to avoid blocking event loop."""
     results = []
     try:
         if os.path.getsize(filepath) == 0: return results
@@ -68,9 +66,7 @@ def search_file_sync(filepath: str, keyword: str) -> list:
                     decoded = raw.decode("utf-8", errors="ignore").strip()
                     u, l, p = parse_line(decoded)
                     
-                    # Search in URL only
                     if kw_lower in u.lower():
-                        # Output format: combo (login:password)
                         if l and p:
                             results.append(f"{l}:{p}")
     except Exception as e:
@@ -78,18 +74,16 @@ def search_file_sync(filepath: str, keyword: str) -> list:
     return results
 
 async def perform_search(keyword: str) -> list:
-    """Scans all .txt files asynchronously."""
     all_hits = set()
-    folder_path = Path(DATA_FOLDER)
+    folder_path = Path(LOCAL_DATA_DIR)
     
     if not folder_path.exists():
         return []
         
-    files = list(folder_path.glob("*.txt"))
+    files = [f for f in folder_path.glob("*") if f.suffix.lower() == ".txt"]
     if not files:
         return []
 
-    # Process each file in a separate thread to keep the bot responsive
     tasks = []
     for fp in files:
         task = asyncio.create_task(
@@ -97,24 +91,49 @@ async def perform_search(keyword: str) -> list:
         )
         tasks.append(task)
     
-    # Gather results
     for future in asyncio.as_completed(tasks):
         res = await future
         all_hits.update(res)
         
     return sorted(list(all_hits))
 
+# ================= LOCAL API HELPERS =================
+
+async def get_file_from_local_api(bot: Bot, file_id: str) -> str:
+    """Calls Local Bot API getFile and returns the local download URL."""
+    url = f"http://localhost:8081/bot{bot.token}/getFile"
+    payload = {"file_id": file_id}
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload) as resp:
+            data = await resp.json()
+            if "result" in data:
+                file_path = data["result"]["file_path"]
+                # Construct full local URL
+                return f"http://localhost:8081/file/{bot.token}/{file_path}"
+            else:
+                raise Exception(f"API Error: {data}")
+
+async def download_file_from_local_api(url: str, dest_path: str):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                with open(dest_path, 'wb') as f:
+                    f.write(await resp.read())
+            else:
+                raise Exception(f"Download failed: {resp.status}")
+
 # ================= HANDLERS =================
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
-        "🎨 *ILPicasso Scanner (Aiogram Edition)*\n\n"
-        "**Commands:**\n"
-        "• Send `.txt` file to add to DB.\n"
-        "• `/u <domain>` : Search in saved DB.\n"
-        "• `/list` : Show saved files.\n"
-        "• `/clear` : Delete all files.",
+        "🎨 *ILPicasso Scanner (Local API Edition)*\n\n"
+        "**Limits Raised:** Supports files up to 2GB.\n\n"
+        "**Workflow:**\n"
+        "1. Send `.txt` file.\n"
+        "2. Wait for download confirmation.\n"
+        "3. Use `/u <domain>` to search.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -122,31 +141,38 @@ async def cmd_start(message: Message):
 async def handle_document(message: Message):
     doc = message.document
     
-    # Check size limit
-    if doc.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
-        await message.reply_text(f"❌ File too large! Max {MAX_FILE_SIZE_MB} MB.")
+    if doc.file_size > MAX_FILE_SIZE_BYTES:
+        await message.reply_text(f"❌ File too large! Max allowed is 2GB.\nYour file: {doc.file_size / (1024*1024*1024):.2f} GB")
         return
 
-    status_msg = await message.reply_text("📥 Downloading...")
+    status_msg = await message.reply_text("📥 Contacting Local API...")
     
     try:
-        # Get file path from Telegram
-        file_info = await message.bot.get_file(doc.file_id)
+        # 1. Get local URL from our custom API server
+        local_download_url = await get_file_from_local_api(message.bot, doc.file_id)
         
-        # Sanitize filename
+        # 2. Define save path
         safe_name = "".join(c for c in doc.file_name if c.isalnum() or c in ('.', '_', '-')).rstrip()
-        if not safe_name: safe_name = f"uploaded_{doc.file_unique_id}.txt"
+        if not safe_name: 
+            safe_name = f"uploaded_{doc.file_unique_id}.txt"
         
-        local_path = os.path.join(DATA_FOLDER, safe_name)
+        target_path = os.path.join(LOCAL_DATA_DIR, safe_name)
         
-        # Download to drive
-        await file_info.download(custom_path=local_path)
+        # 3. Download from Local API to Container Disk
+        await download_file_from_local_api(local_download_url, target_path)
         
-        count = len(list(Path(DATA_FOLDER).glob("*.txt")))
-        await status_msg.edit_text(f"✅ Saved `{safe_name}`.\nTotal files in DB: {count}", parse_mode=ParseMode.MARKDOWN)
+        count = len([f for f in Path(LOCAL_DATA_DIR).glob("*") if f.suffix.lower() == ".txt"])
+        size_mb = doc.file_size / (1024 * 1024)
+        
+        await status_msg.edit_text(
+            f"✅ Saved `{safe_name}` ({size_mb:.2f} MB).\n"
+            f"Files in DB: {count}\n"
+            f"Ready to search!", 
+            parse_mode=ParseMode.MARKDOWN
+        )
         
     except Exception as e:
-        await status_msg.edit_text(f"⛔ Error saving file: {str(e)}")
+        await status_msg.edit_text(f"⛔ Error downloading file: {str(e)}")
         print(f"Download Error: {e}")
 
 @router.message(CommandObject(command="u"))
@@ -173,33 +199,27 @@ async def handle_scan(message: Message, command: CommandObject):
             body = "\n".join(results)
             full_message = header + body
             
-            # Safety check for message length (Telegram limit ~4096 chars)
             if len(full_message) > 4000:
-                 # Switch to file mode if text is unexpectedly long
                  raise ValueError("Too long for text")
                  
             await status_msg.delete()
             await message.reply_text(full_message, disable_web_page_preview=True)
             
         else:
-            # Create temporary file for results
             temp_filename = f"/tmp/results_{int(asyncio.get_event_loop().time())}.txt"
             with open(temp_filename, "w", encoding="utf-8") as f:
                 f.write("\n".join(results))
                 
             await status_msg.delete()
             
-            # Send as document
             await message.answer_document(
                 document=FSInputFile(temp_filename),
                 caption=f"✅ Found {count} matches for `{keyword}`."
             )
             
-            # Cleanup temp file
             os.remove(temp_filename)
             
     except ValueError:
-        # Fallback logic if text was too long
         temp_filename = f"/tmp/results_fallback_{int(asyncio.get_event_loop().time())}.txt"
         with open(temp_filename, "w", encoding="utf-8") as f:
             f.write("\n".join(results))
@@ -213,15 +233,13 @@ async def handle_scan(message: Message, command: CommandObject):
 
 @router.message(CommandObject(command="list"))
 async def handle_list(message: Message):
-    files = list(Path(DATA_FOLDER).glob("*.txt"))
+    files = [f.name for f in Path(LOCAL_DATA_DIR).glob("*") if f.suffix.lower() == ".txt"]
     if not files:
         await message.reply_text("📂 Database is empty.")
         return
     
-    names = [f.name for f in files]
-    text = "📄 **Saved Files:**\n" + "\n".join([f"- {n}" for n in names])
+    text = "📄 **Saved Files:**\n" + "\n".join([f"- {n}" for n in files])
     
-    # Truncate if too many files
     if len(text) > 4000:
         text = text[:4000] + "\n..."
         
@@ -229,7 +247,7 @@ async def handle_list(message: Message):
 
 @router.message(CommandObject(command="clear"))
 async def handle_clear(message: Message):
-    files = list(Path(DATA_FOLDER).glob("*.txt"))
+    files = list(Path(LOCAL_DATA_DIR).glob("*"))
     if not files:
         await message.reply_text("🗑️ Nothing to clear.")
         return
@@ -237,26 +255,27 @@ async def handle_clear(message: Message):
     count = 0
     for f in files:
         try:
-            os.remove(f)
-            count += 1
+            if f.is_file():
+                os.remove(f)
+                count += 1
         except OSError:
             pass
             
-    await message.reply_text(f"🗑️ Cleared {count} files from database.")
+    await message.reply_text(f"🗑️ Cleared {count} files.")
 
 # ================= MAIN ENTRY POINT =================
 
 async def main():
-    # Initialize Bot with default properties
+    # Initialize Bot normally. 
+    # Note: Regular messages (sendText, etc.) go to api.telegram.org via Aiogram default.
+    # Only FILE operations are intercepted by our helper functions above to use localhost:8081.
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     
-    print("🤖 Starting Aiogram Bot on Railway...")
-    
-    # Start polling
+    print("🤖 Starting Hybrid Mode (Aiogram for Msgs, Local API for Files)...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Bot stopped by user.")
+        print("Stopped.")

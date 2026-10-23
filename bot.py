@@ -301,7 +301,7 @@ async def handle_clear(message: Message):
 async def main():
     session = AiohttpSession(
         api=TelegramAPIServer.from_base(LOCAL_API_URL, is_local=True),
-        timeout=300,
+        timeout=2000,
     )
     bot = Bot(
         token=BOT_TOKEN,

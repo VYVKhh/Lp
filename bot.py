@@ -1,58 +1,57 @@
 import os
-import re
 import mmap
 import asyncio
 from pathlib import Path
-from telegram import Update, InputFile
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.filters import CommandStart, CommandObject
+from aiogram.types import Message, FSInputFile
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 
-# ================= CONFIGURATION FROM ENVIRONMENT =================
-# في Railway، تضع BOT_TOKEN في تبويب Variables
-BOT_TOKEN = os.getenv("BOT_TOKEN") 
+# ================= CONFIGURATION =================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATA_FOLDER = "/app/data"  # مسار التخزين الدائم (Volume)
+MAX_FILE_SIZE_MB = 50      # حد أقصى للملف
+THRESHOLD_FOR_TEXT_OUTPUT = 20 # عدد النتائج التي تُرسل كنص قبل تحويلها لملف
 
-# مسار التخزين الدائم الذي سنربطه بـ Volume في Railway
-# تأكد من أن هذا المسار موجود ومصرح بالكتابة عليه
-DATA_FOLDER = "/app/data"  
-
-MAX_FILE_SIZE_MB = 50
-THRESHOLD_FOR_TEXT_OUTPUT = 20
-
-SEARCH_PART = "url"
-OUTPUT_FORMAT = "combo"
-CASE_SENSITIVE = False
-USE_REGEX = False
-
-# التحقق من وجود التوكن عند بدء التشغيل
 if not BOT_TOKEN:
-    raise ValueError("⛔ ERROR: BOT_TOKEN environment variable is missing! Set it in Railway Dashboard.")
+    raise ValueError("Error: BOT_TOKEN environment variable is missing.")
 
-# إنشاء مجلد البيانات إذا لم يكن موجوداَ (مهم لأول تشغيل)
 os.makedirs(DATA_FOLDER, exist_ok=True)
 
-# ... (نفس دوال parse_ulp_line, search_in_file, perform_search السابقة دون تغيير) ...
+# Initialize Bot and Dispatcher
+router = Router()
+dp = Dispatcher()
+dp.include_router(router)
 
-def parse_ulp_line(line: str) -> tuple[str, str, str]:
+# ================= CORE LOGIC (Same as before, optimized for sync/async mix) =================
+
+def parse_line(line: str):
+    """Extracts url, login, pass from 'url:login:pass' format."""
     line = line.strip()
     if not line: return "", "", ""
+    
     c1 = line.find(":")
     if c1 == -1: return line, "", ""
+    
     url_end = c1
+    # Handle protocols like https://
     if len(line) > c1 + 2 and line[c1:c1+3] == "://":
         c2 = line.find(":", c1 + 3)
         if c2 != -1: url_end = c2
+        
     url_s = line[:url_end]
     rest = line[url_end + 1:]
     sep = rest.find(":")
     if sep == -1: return url_s, rest, ""
-    login_s = rest[:sep]
-    pass_s = rest[sep+1:]
-    return url_s, login_s, pass_s
+    
+    return url_s, rest[:sep], rest[sep+1:]
 
-def search_in_file(filepath: str, keyword: str) -> list[str]:
+def search_file_sync(filepath: str, keyword: str) -> list:
+    """Searches a single file using mmap. Runs in thread pool to avoid blocking event loop."""
     results = []
     try:
-        size = os.path.getsize(filepath)
-        if size == 0: return results
+        if os.path.getsize(filepath) == 0: return results
         with open(filepath, "rb") as fh:
             with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 sz = mm.size()
@@ -65,150 +64,199 @@ def search_in_file(filepath: str, keyword: str) -> list[str]:
                     pos = end + 1
                     if raw.endswith(b"\r"): raw = raw[:-1]
                     if not raw: continue
-                    try: decoded = raw.decode("utf-8", errors="ignore").strip()
-                    except UnicodeDecodeError: continue
-                    u, l, p = parse_ulp_line(decoded)
-                    target = u if SEARCH_PART == "url" else (l if SEARCH_PART == "login" else (p if SEARCH_PART == "password" else decoded))
-                    match_found = False
-                    if CASE_SENSITIVE:
-                        if keyword in target: match_found = True
-                    else:
-                        if kw_lower in target.lower(): match_found = True
-                    if match_found:
-                        out_str = f"{l}:{p}" if OUTPUT_FORMAT == "combo" else decoded
-                        if out_str: results.append(out_str)
+                    
+                    decoded = raw.decode("utf-8", errors="ignore").strip()
+                    u, l, p = parse_line(decoded)
+                    
+                    # Search in URL only
+                    if kw_lower in u.lower():
+                        # Output format: combo (login:password)
+                        if l and p:
+                            results.append(f"{l}:{p}")
     except Exception as e:
-        print(f"Error scanning {filepath}: {e}")
+        print(f"Scan error in {filepath}: {e}")
     return results
 
-async def perform_search(keyword: str) -> list[str]:
-    all_results = []
-    seen_set = set()
+async def perform_search(keyword: str) -> list:
+    """Scans all .txt files asynchronously."""
+    all_hits = set()
     folder_path = Path(DATA_FOLDER)
-    if not folder_path.exists(): return []
+    
+    if not folder_path.exists():
+        return []
+        
     files = list(folder_path.glob("*.txt"))
-    if not files: return []
+    if not files:
+        return []
+
+    # Process each file in a separate thread to keep the bot responsive
+    tasks = []
     for fp in files:
-        res = await asyncio.to_thread(search_in_file, str(fp), keyword)
-        for r in res:
-            if r not in seen_set:
-                seen_set.add(r)
-                all_results.append(r)
-    return all_results
+        task = asyncio.create_task(
+            asyncio.to_thread(search_file_sync, str(fp), keyword)
+        )
+        tasks.append(task)
+    
+    # Gather results
+    for future in asyncio.as_completed(tasks):
+        res = await future
+        all_hits.update(res)
+        
+    return sorted(list(all_hits))
 
-# ... (نفس Handlers السابقة start, handle_document, handle_scan, etc.) ...
+# ================= HANDLERS =================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎨 *ILPicasso Personal Scanner (Railway Edition)*\n\n"
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    await message.answer(
+        "🎨 *ILPicasso Scanner (Aiogram Edition)*\n\n"
         "**Commands:**\n"
-        "`/u <domain>` : Search in saved DB.\n"
-        "`/list` : Show saved files.\n"
-        "`/clear` : Delete all files.\n"
-        "\nSend `.txt` files to add them."
+        "• Send `.txt` file to add to DB.\n"
+        "• `/u <domain>` : Search in saved DB.\n"
+        "• `/list` : Show saved files.\n"
+        "• `/clear` : Delete all files.",
+        parse_mode=ParseMode.MARKDOWN
     )
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    doc = msg.document
-    if not doc: return
-    filename = doc.file_name or "unknown.txt"
-    if not filename.lower().endswith(".txt"):
-        await msg.reply_text("❌ Only .txt files accepted.")
-        return
+@router.message(F.document & F.document.file_name.regexp(r".*\.txt$"))
+async def handle_document(message: Message):
+    doc = message.document
+    
+    # Check size limit
     if doc.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
-        await msg.reply_text(f"❌ File too large! Max {MAX_FILE_SIZE_MB} MB.")
+        await message.reply_text(f"❌ File too large! Max {MAX_FILE_SIZE_MB} MB.")
         return
 
-    status_msg = await msg.reply_text("📥 Downloading...")
+    status_msg = await message.reply_text("📥 Downloading...")
+    
     try:
-        tg_file = await context.bot.get_file(doc.file_id)
-        safe_filename = "".join(c for c in filename if c.isalnum() or c in ('.', '_', '-')).rstrip()
-        if not safe_filename: safe_filename = "uploaded.txt"
+        # Get file path from Telegram
+        file_info = await message.bot.get_file(doc.file_id)
         
-        # التأكد من أن المسار كامل وصحيح
-        local_path = os.path.join(DATA_FOLDER, safe_filename)
+        # Sanitize filename
+        safe_name = "".join(c for c in doc.file_name if c.isalnum() or c in ('.', '_', '-')).rstrip()
+        if not safe_name: safe_name = f"uploaded_{doc.file_unique_id}.txt"
         
-        await tg_file.download_to_drive(custom_path=local_path)
+        local_path = os.path.join(DATA_FOLDER, safe_name)
+        
+        # Download to drive
+        await file_info.download(custom_path=local_path)
         
         count = len(list(Path(DATA_FOLDER).glob("*.txt")))
-        await status_msg.edit_text(f"✅ Saved `{safe_filename}`.\nTotal files: {count}")
+        await status_msg.edit_text(f"✅ Saved `{safe_name}`.\nTotal files in DB: {count}", parse_mode=ParseMode.MARKDOWN)
+        
     except Exception as e:
-        await status_msg.edit_text(f"⛔ Error: {str(e)}")
+        await status_msg.edit_text(f"⛔ Error saving file: {str(e)}")
+        print(f"Download Error: {e}")
 
-async def handle_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    args = context.args
+@router.message(CommandObject(command="u"))
+async def handle_scan(message: Message, command: CommandObject):
+    args = command.args
     if not args:
-        await msg.reply_text("❌ Usage: `/u domain.com`")
+        await message.reply_text("Usage: /u domain.com")
         return
+    
     keyword = " ".join(args)
-    status_msg = await msg.reply_text(f"🔍 Scanning for `{keyword}`...")
+    status_msg = await message.reply_text(f"🔍 Scanning database for `{keyword}`...", parse_mode=ParseMode.MARKDOWN)
+    
     try:
         results = await perform_search(keyword)
+        
         if not results:
-            await status_msg.edit_text(f"💔 No matches for `{keyword}`.")
+            await status_msg.edit_text(f"💔 No matches found for `{keyword}`.", parse_mode=ParseMode.MARKDOWN)
             return
+            
         count = len(results)
         header = f"✅ Found {count} matches:\n\n"
+        
         if count <= THRESHOLD_FOR_TEXT_OUTPUT:
             body = "\n".join(results)
             full_message = header + body
-            if len(full_message) > 4000: raise ValueError("Too long")
+            
+            # Safety check for message length (Telegram limit ~4096 chars)
+            if len(full_message) > 4000:
+                 # Switch to file mode if text is unexpectedly long
+                 raise ValueError("Too long for text")
+                 
             await status_msg.delete()
-            await msg.reply_text(full_message, disable_web_page_preview=True)
+            await message.reply_text(full_message, disable_web_page_preview=True)
+            
         else:
-            temp_filename = f"results_{int(asyncio.get_event_loop().time())}.txt"
+            # Create temporary file for results
+            temp_filename = f"/tmp/results_{int(asyncio.get_event_loop().time())}.txt"
             with open(temp_filename, "w", encoding="utf-8") as f:
                 f.write("\n".join(results))
+                
             await status_msg.delete()
-            with open(temp_filename, "rb") as f_out:
-                await msg.reply_document(document=f_out, caption=f"✅ Found {count} matches.", filename=temp_filename)
+            
+            # Send as document
+            await message.answer_document(
+                document=FSInputFile(temp_filename),
+                caption=f"✅ Found {count} matches for `{keyword}`."
+            )
+            
+            # Cleanup temp file
             os.remove(temp_filename)
+            
     except ValueError:
-        temp_filename = f"results_{int(asyncio.get_event_loop().time())}.txt"
+        # Fallback logic if text was too long
+        temp_filename = f"/tmp/results_fallback_{int(asyncio.get_event_loop().time())}.txt"
         with open(temp_filename, "w", encoding="utf-8") as f:
             f.write("\n".join(results))
         await status_msg.delete()
-        with open(temp_filename, "rb") as f_out:
-            await msg.reply_document(document=f_out, caption=f"✅ Found {len(results)} matches.")
+        await message.answer_document(document=FSInputFile(temp_filename), caption=f"✅ Found {len(results)} matches.")
         os.remove(temp_filename)
+        
     except Exception as e:
         await status_msg.edit_text(f"⛔ Scan Error: {str(e)}")
+        print(f"Scan Error: {e}")
 
-async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@router.message(CommandObject(command="list"))
+async def handle_list(message: Message):
     files = list(Path(DATA_FOLDER).glob("*.txt"))
     if not files:
-        await update.message.reply_text("📂 Database empty.")
+        await message.reply_text("📂 Database is empty.")
         return
+    
     names = [f.name for f in files]
     text = "📄 **Saved Files:**\n" + "\n".join([f"- {n}" for n in names])
-    if len(text) > 4000: text = text[:4000] + "\n..."
-    await update.message.reply_text(text)
+    
+    # Truncate if too many files
+    if len(text) > 4000:
+        text = text[:4000] + "\n..."
+        
+    await message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-async def handle_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@router.message(CommandObject(command="clear"))
+async def handle_clear(message: Message):
     files = list(Path(DATA_FOLDER).glob("*.txt"))
     if not files:
-        await update.message.reply_text("🗑️ Nothing to clear.")
+        await message.reply_text("🗑️ Nothing to clear.")
         return
+    
     count = 0
     for f in files:
         try:
             os.remove(f)
             count += 1
-        except OSError: pass
-    await update.message.reply_text(f"🗑️ Cleared {count} files.")
+        except OSError:
+            pass
+            
+    await message.reply_text(f"🗑️ Cleared {count} files from database.")
 
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("u", handle_scan))
-    app.add_handler(CommandHandler("list", handle_list))
-    app.add_handler(CommandHandler("clear", handle_clear))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+# ================= MAIN ENTRY POINT =================
+
+async def main():
+    # Initialize Bot with default properties
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     
-    print("🤖 Bot started on Railway...")
-    app.run_polling()
+    print("🤖 Starting Aiogram Bot on Railway...")
+    
+    # Start polling
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Bot stopped by user.")

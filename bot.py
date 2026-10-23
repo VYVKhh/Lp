@@ -69,6 +69,30 @@ def search_file_sync(filepath: str, keyword: str) -> list:
         print(f"Scan error in {filepath}: {e}")
     return results
 
+def count_lines_sync(filepath: str) -> int:
+    count = 0
+    try:
+        if os.path.getsize(filepath) == 0: return 0
+        with open(filepath, "rb") as fh:
+            with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                sz = mm.size()
+                pos = 0
+                while pos < sz:
+                    end = mm.find(b"\n", pos)
+                    if end == -1:
+                        if pos < sz:
+                            count += 1
+                        break
+                    raw = mm[pos:end]
+                    pos = end + 1
+                    if raw.strip(b"\r"):
+                        count += 1
+                    elif raw:
+                        count += 1
+    except Exception as e:
+        print(f"Count error in {filepath}: {e}")
+    return count
+
 async def perform_search(keyword: str) -> list:
     all_hits = set()
     folder_path = Path(LOCAL_DATA_DIR)
@@ -88,6 +112,17 @@ async def perform_search(keyword: str) -> list:
         all_hits.update(res)
     return sorted(list(all_hits))
 
+async def compute_stats():
+    folder_path = Path(LOCAL_DATA_DIR)
+    if not folder_path.exists():
+        return 0, 0
+    files = list(folder_path.rglob("*.txt"))
+    if not files:
+        return 0, 0
+    tasks = [asyncio.to_thread(count_lines_sync, str(fp)) for fp in files]
+    results = await asyncio.gather(*tasks)
+    return len(files), sum(results)
+
 # ================= HANDLERS =================
 
 @router.message(CommandStart())
@@ -98,7 +133,8 @@ async def cmd_start(message: Message):
         "**Workflow:**\n"
         "1. Send `.txt` file.\n"
         "2. Wait for download confirmation.\n"
-        "3. Use `/u <domain>` to search.",
+        "3. Use `/u <domain>` to search.\n"
+        "4. Use `/s` to see stats.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -113,8 +149,6 @@ async def handle_document(message: Message):
     status_msg = await message.answer("📥 Processing via Local API...")
 
     try:
-        # في الوضع المحلي، bot.get_file يتصل تلقائياً بـ 127.0.0.1:8081
-        # ويعيد file_path كمسار مطلق على القرص مباشرة (لا حاجة لـ aiohttp يدوي)
         file = await message.bot.get_file(doc.file_id)
         source_path = file.file_path
 
@@ -142,6 +176,10 @@ async def handle_document(message: Message):
             f"Ready to search!",
             parse_mode=ParseMode.MARKDOWN
         )
+
+    except asyncio.TimeoutError:
+        await status_msg.edit_text("⏳ Timeout while downloading the file from Telegram, please try again.")
+        print("Download Timeout Error")
 
     except Exception as e:
         await status_msg.edit_text(f"⛔ Error processing file: {str(e)}")
@@ -208,6 +246,24 @@ async def handle_scan(message: Message):
         await status_msg.edit_text(f"⛔ Scan Error: {str(e)}")
         print(f"Scan Error: {e}")
 
+@router.message(Command("s"))
+async def handle_stats(message: Message):
+    status_msg = await message.answer("📊 Calculating stats...")
+
+    try:
+        file_count, total_lines = await compute_stats()
+
+        await status_msg.edit_text(
+            f"📊 *Database Stats*\n\n"
+            f"Files: `{file_count}`\n"
+            f"Total lines: `{total_lines}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    except Exception as e:
+        await status_msg.edit_text(f"⛔ Stats Error: {str(e)}")
+        print(f"Stats Error: {e}")
+
 @router.message(Command("list"))
 async def handle_list(message: Message):
     files = [f.name for f in Path(LOCAL_DATA_DIR).rglob("*.txt")]
@@ -243,11 +299,9 @@ async def handle_clear(message: Message):
 # ================= MAIN ENTRY POINT =================
 
 async def main():
-    # ربط البوت بالخادم المحلي بدلاً من api.telegram.org
-    # هذا السطر هو سبب أخطاء 400/404/Conflict السابقة: البوت كان يستخدم
-    # الخادم الرسمي بعد أن سجّلنا خروجه منه (logOut) لصالح الخادم المحلي
     session = AiohttpSession(
-        api=TelegramAPIServer.from_base(LOCAL_API_URL, is_local=True)
+        api=TelegramAPIServer.from_base(LOCAL_API_URL, is_local=True),
+        timeout=300,
     )
     bot = Bot(
         token=BOT_TOKEN,

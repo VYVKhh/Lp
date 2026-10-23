@@ -1,6 +1,7 @@
 import os
 import mmap
 import asyncio
+import shutil
 from pathlib import Path
 from aiogram import Bot, Dispatcher, Router, F
 # استيراد الفلاتر الصحيحة والمطلوبة
@@ -88,7 +89,8 @@ async def perform_search(keyword: str) -> list:
     if not folder_path.exists():
         return []
         
-    files = [f for f in folder_path.glob("*") if f.suffix.lower() == ".txt"]
+    # FIX: Use rglob to search recursively in subdirectories (e.g., /app/data/documents/)
+    files = list(folder_path.rglob("*.txt"))
     if not files:
         return []
 
@@ -105,38 +107,10 @@ async def perform_search(keyword: str) -> list:
         
     return sorted(list(all_hits))
 
-# ================= LOCAL API HELPERS =================
-
-async def get_file_from_local_api(bot: Bot, file_id: str) -> str:
-    """Calls Local Bot API getFile and returns the local download URL."""
-    url = f"http://localhost:8081/bot{bot.token}/getFile"
-    payload = {"file_id": file_id}
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload) as resp:
-            data = await resp.json()
-            if "result" in data:
-                file_path = data["result"]["file_path"]
-                # Construct full local URL pointing to our server
-                return f"http://localhost:8081/file/{bot.token}/{file_path}"
-            else:
-                raise Exception(f"API Error: {data}")
-
-async def download_file_from_local_api(url: str, dest_path: str):
-    """Downloads file from Local API to container disk."""
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                with open(dest_path, 'wb') as f:
-                    f.write(await resp.read())
-            else:
-                raise Exception(f"Download failed: {resp.status}")
-
 # ================= HANDLERS =================
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
-    # FIX: Used message.answer instead of reply_text
     await message.answer(
         "🎨 *ILPicasso Scanner (Local API Edition)*\n\n"
         "**Limits Raised:** Supports files up to 2GB.\n\n"
@@ -152,40 +126,70 @@ async def handle_document(message: Message):
     doc = message.document
     
     if doc.file_size > MAX_FILE_SIZE_BYTES:
-        # FIX: Used message.answer
         await message.answer(f"❌ File too large! Max allowed is 2GB.\nYour file: {doc.file_size / (1024*1024*1024):.2f} GB")
         return
 
-    # FIX: Used message.answer to create status message
-    status_msg = await message.answer("📥 Contacting Local API...")
+    status_msg = await message.answer("📥 Processing via Local API...")
     
     try:
-        # 1. Get local URL from our custom API server
-        local_download_url = await get_file_from_local_api(message.bot, doc.file_id)
+        # 1. Call getFile on the LOCAL server running at localhost:8081
+        # We use aiohttp here because aiogram's default bot object points to api.telegram.org.
+        # Our local binary listens on 8081.
+        url = f"http://localhost:8081/bot{message.bot.token}/getFile"
+        payload = {"file_id": doc.file_id}
         
-        # 2. Define save path
-        safe_name = "".join(c for c in doc.file_name if c.isalnum() or c in ('.', '_', '-')).rstrip()
-        if not safe_name: 
-            safe_name = f"uploaded_{doc.file_unique_id}.txt"
-        
-        target_path = os.path.join(LOCAL_DATA_DIR, safe_name)
-        
-        # 3. Download from Local API to Container Disk
-        await download_file_from_local_api(local_download_url, target_path)
-        
-        count = len([f for f in Path(LOCAL_DATA_DIR).glob("*") if f.suffix.lower() == ".txt"])
-        size_mb = doc.file_size / (1024 * 1024)
-        
-        await status_msg.edit_text(
-            f"✅ Saved `{safe_name}` ({size_mb:.2f} MB).\n"
-            f"Files in DB: {count}\n"
-            f"Ready to search!", 
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as resp:
+                data = await resp.json()
+                
+                if "result" not in data:
+                    raise Exception(f"API Error: {data}")
+                
+                # In --local mode, 'file_path' is usually a relative path like "documents/file_xxx.txt"
+                remote_file_path = data["result"]["file_path"]
+                print(f"DEBUG: Remote file path returned by API: {remote_file_path}")
+                
+                # Construct the expected local path where the binary saved it.
+                # Since we ran the binary with --dir=/app/data, the file should be physically located there.
+                source_path = os.path.join("/app/data", remote_file_path)
+                
+                # Verify existence
+                if not os.path.exists(source_path):
+                     # Sometimes the API returns just filename if configured differently, check root too
+                     alt_source = os.path.join("/app/data", os.path.basename(remote_file_path))
+                     if os.path.exists(alt_source):
+                         source_path = alt_source
+                     else:
+                         raise FileNotFoundError(f"File not found locally at {source_path} or {alt_source}. Check API logs.")
+
+                print(f"DEBUG: Found local source file at: {source_path}")
+
+                # 2. Define destination name for the Bot's database folder
+                safe_name = "".join(c for c in doc.file_name if c.isalnum() or c in ('.', '_', '-')).rstrip()
+                if not safe_name: 
+                    safe_name = f"uploaded_{doc.file_unique_id}.txt"
+                
+                target_path = os.path.join(LOCAL_DATA_DIR, safe_name)
+                
+                # 3. COPY the file from the API's storage location to our Bot's specific DB folder
+                # This ensures the search function finds it easily later
+                shutil.copy2(source_path, target_path)
+                
+                count = len(list(Path(LOCAL_DATA_DIR).rglob("*.txt")))
+                size_mb = doc.file_size / (1024 * 1024)
+                
+                await status_msg.edit_text(
+                    f"✅ Saved `{safe_name}` ({size_mb:.2f} MB).\n"
+                    f"Files in DB: {count}\n"
+                    f"Ready to search!", 
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
     except Exception as e:
-        await status_msg.edit_text(f"⛔ Error downloading file: {str(e)}")
-        print(f"Download Error: {e}")
+        await status_msg.edit_text(f"⛔ Error processing file: {str(e)}")
+        print(f"Download/Copy Error: {e}")
+        import traceback
+        traceback.print_exc()
 
 @router.message(Command("u"))
 async def handle_scan(message: Message):
@@ -193,13 +197,11 @@ async def handle_scan(message: Message):
     parts = text.split(maxsplit=1)
     
     if len(parts) < 2:
-        # FIX: Used message.answer
         await message.answer("Usage: /u domain.com")
         return
     
     keyword = parts[1].strip()
     
-    # FIX: Used message.answer
     status_msg = await message.answer(f"🔍 Scanning database for `{keyword}`...", parse_mode=ParseMode.MARKDOWN)
     
     try:
@@ -220,7 +222,6 @@ async def handle_scan(message: Message):
                  raise ValueError("Too long for text")
                  
             await status_msg.delete()
-            # FIX: Used message.answer
             await message.answer(full_message, disable_web_page_preview=True)
             
         else:
@@ -251,9 +252,9 @@ async def handle_scan(message: Message):
 
 @router.message(Command("list"))
 async def handle_list(message: Message):
-    files = [f.name for f in Path(LOCAL_DATA_DIR).glob("*") if f.suffix.lower() == ".txt"]
+    # Use rglob here too to show files in subfolders if any
+    files = [f.name for f in Path(LOCAL_DATA_DIR).rglob("*.txt")]
     if not files:
-        # FIX: Used message.answer
         await message.answer("📂 Database is empty.")
         return
     
@@ -262,14 +263,13 @@ async def handle_list(message: Message):
     if len(text) > 4000:
         text = text[:4000] + "\n..."
         
-    # FIX: Used message.answer
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
 @router.message(Command("clear"))
 async def handle_clear(message: Message):
-    files = list(Path(LOCAL_DATA_DIR).glob("*"))
+    # Clear everything in /app/data including subfolders created by API
+    files = list(Path(LOCAL_DATA_DIR).rglob("*"))
     if not files:
-        # FIX: Used message.answer
         await message.answer("🗑️ Nothing to clear.")
         return
     
@@ -282,7 +282,6 @@ async def handle_clear(message: Message):
         except OSError:
             pass
             
-    # FIX: Used message.answer
     await message.answer(f"🗑️ Cleared {count} files.")
 
 # ================= MAIN ENTRY POINT =================

@@ -137,6 +137,7 @@ async def cmd_start(message: Message):
         parse_mode=ParseMode.MARKDOWN
     )
 
+# FIX: Using explicit filter definition instead of lambda/regexp directly in decorator
 @router.message(F.document & F.document.file_name.regexp(r".*\.txt$"))
 async def handle_document(message: Message):
     doc = message.document
@@ -266,9 +267,6 @@ async def handle_clear(message: Message):
 # ================= MAIN ENTRY POINT =================
 
 async def main():
-    # Initialize Bot normally. 
-    # Note: Regular messages (sendText, etc.) go to api.telegram.org via Aiogram default.
-    # Only FILE operations are intercepted by our helper functions above to use localhost:8081.
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     
     print("🤖 Starting Hybrid Mode (Aiogram for Msgs, Local API for Files)...")

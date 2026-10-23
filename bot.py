@@ -3,7 +3,8 @@ import mmap
 import asyncio
 from pathlib import Path
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.filters import CommandStart, CommandObject
+# استيراد الفلاتر الصحيحة
+from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, FSInputFile
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -137,7 +138,6 @@ async def cmd_start(message: Message):
         parse_mode=ParseMode.MARKDOWN
     )
 
-# FIX: Using explicit filter definition instead of lambda/regexp directly in decorator
 @router.message(F.document & F.document.file_name.regexp(r".*\.txt$"))
 async def handle_document(message: Message):
     doc = message.document
@@ -176,14 +176,20 @@ async def handle_document(message: Message):
         await status_msg.edit_text(f"⛔ Error downloading file: {str(e)}")
         print(f"Download Error: {e}")
 
-@router.message(CommandObject(command="u"))
-async def handle_scan(message: Message, command: CommandObject):
-    args = command.args
-    if not args:
+# FIX: Changed CommandObject to Command
+@router.message(Command("u"))
+async def handle_scan(message: Message):
+    # Extract arguments manually since we aren't using CommandObject injection here
+    # Or better, use CommandObject properly if needed, but simple parsing works best for stability
+    text = message.text or ""
+    parts = text.split(maxsplit=1)
+    
+    if len(parts) < 2:
         await message.reply_text("Usage: /u domain.com")
         return
     
-    keyword = " ".join(args)
+    keyword = parts[1].strip()
+    
     status_msg = await message.reply_text(f"🔍 Scanning database for `{keyword}`...", parse_mode=ParseMode.MARKDOWN)
     
     try:
@@ -232,7 +238,8 @@ async def handle_scan(message: Message, command: CommandObject):
         await status_msg.edit_text(f"⛔ Scan Error: {str(e)}")
         print(f"Scan Error: {e}")
 
-@router.message(CommandObject(command="list"))
+# FIX: Changed CommandObject to Command
+@router.message(Command("list"))
 async def handle_list(message: Message):
     files = [f.name for f in Path(LOCAL_DATA_DIR).glob("*") if f.suffix.lower() == ".txt"]
     if not files:
@@ -246,7 +253,8 @@ async def handle_list(message: Message):
         
     await message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-@router.message(CommandObject(command="clear"))
+# FIX: Changed CommandObject to Command
+@router.message(Command("clear"))
 async def handle_clear(message: Message):
     files = list(Path(LOCAL_DATA_DIR).glob("*"))
     if not files:
